@@ -1,134 +1,176 @@
-# how to use 2 nns, one for game state and one for decision based on first nn (not actor-critic?
-
+import ale_py
+import shimmy
 import gymnasium as gym
 import numpy as np
 import keyboard
 import pickle
-np.set_printoptions(threshold=np.inf)
-episodes = 100000
-learning_rate = 0.00002
-# input_length = 33600 # 210 * 160
-input_length = 25440
-hidden_layer = 200
+import matplotlib.pyplot as plt
 
-def save():
-    with open('model.pickle', 'wb') as file:
-        pickle.dump(policy, file)
+lr = 1e-4
+discount_factor = 0.95
+episodes = 500
+beta_1 = 0.9
+beta_2 = 0.99
+epsilon = 1e-6
+rng = np.random.default_rng(5)
 
-keyboard.add_hotkey('p', lambda: save())
+class MLP:
+    def __init__(self, input_len, hidden_layer):
+        self.layers = {}
+        self.layers['W1'] = rng.normal(size=(input_len, hidden_layer)) / (input_len**0.5) * 5/3
+        self.layers['B1'] = rng.normal(size=(hidden_layer)) * 0.01
+        self.layers['W2'] = rng.normal(size=(hidden_layer, 1)) / (hidden_layer**0.5)
+        # self.B2 = np.random.randn(1) * 0.01
+        self.dlayers = {}
 
-class Policy:
-    def __init__(self):
-        self.w1 = np.random.randn(hidden_layer, input_length) / np.sqrt(input_length)
-        self.w2 = np.random.randn(hidden_layer) / np.sqrt(hidden_layer)
-        self.b = np.random.randn(hidden_layer) / np.sqrt(hidden_layer)
+        # tracking
+        self.h = []
+        # self.h2 = []
+        # self.temp = []
+
+        # adam
+        self.num_updates = 0
+        self.m = {k : np.zeros_like(v) for k, v in self.layers.items()} # momentum
+        self.v = {k : np.zeros_like(v) for k, v in self.layers.items()} # running mean of gradient^2
 
 
     def forward(self, x):
-        h = np.matmul(self.w1, x) + self.b
-        h[h<0] = 0 # relu
-        y = np.matmul(self.w2, h) # log probability
+        hidden2 = x @ self.layers['W1'] + self.layers['B1']
+        
+        hidden = np.tanh(hidden2)
+        a = hidden @ self.layers['W2']
 
-        return y, h
+        # self.temp.append(hidden2)
+        self.h.append(hidden)
+        # self.h2.append(a.copy())
 
-    def backprop(self, A, h, w1, w2, b, x):
-        dw2 = A * h
-        gradient = A * self.w2
-        gradient[h<=0] = 0
-        db = gradient
-        dw1 = np.outer(gradient, x)
+        return 1.0 / (1.0 + np.exp(-a)[0].astype(np.float32)) # sigmoid
+    
+    def backprop(self, x, probs, gradients):
+        self.num_updates += 1
 
-        w1 += dw1 
-        w2 += dw2
-        b += db
+        self.h = np.array(self.h)
+        # self.h2 = np.array(self.h2)
+        
+        gradients *= probs * (1-probs) # (batch, 1)
+        # self.dB2 = gradients.sum(0) # (batch, 1).sum(0) = (1)
+        self.dlayers['W2'] = self.h.transpose() @ gradients # (200, batch) @ (batch, 1) = (200, 1)
+        gradients = gradients @ self.layers['W2'].transpose() * (1-self.h**2)# (batch, 1) @ (1, 200) = (batch, 200)
+        self.dlayers['B1'] = gradients.sum(0) # (batch, 200).sum(0) = (200)
+        self.dlayers['W1'] = x.transpose() @ gradients # (6400, batch) @ (batch, 200)
 
-    def update_weights(self, dw1, dw2, db):
-        self.w1 += dw1
-        self.w2 += dw2
-        self.b += db
-
-        # print(np.max(self.w2))
+        # adam
+        for k, _ in self.layers.items():
+            self.m[k] = beta_1 * self.m[k] + (1-beta_1) * self.dlayers[k]
+            self.v[k] = beta_2 * self.v[k] + (1-beta_2) * self.dlayers[k]**2
+            mhat = self.m[k] / (1-beta_1**self.num_updates) # unbiased version
+            vhat = self.v[k] / (1-beta_2**self.num_updates) # unbiased version
+            self.layers[k] -= lr / (epsilon + np.sqrt(vhat)) * mhat
 
     def choose_action(self, observation):
-        y, h = self.forward(observation)
-        x = 1.0 / (1.0 + np.exp(-y)) # probability of moving down
-        print(str(x))
-        if np.random.uniform() > x:
-            return 2, h, x # up 
+        prob = self.forward(np.array(observation)) # probability of moving down
+        if rng.uniform() > prob:
+            return 2, prob # up 
         else:
-            return 3, h, x # down
-    
+            return 3, prob # down
+
+    def reset_grad(self):
+        self.h = []
+        # self.h2 = []
+        # self.temp = []
+
 def preprocess(frame):
     # erase everything except ball and paddles
     frame = frame[34:193]
+    frame = frame[::2, ::2]
     frame[frame==87] = 0
     frame[frame!=0] = 1
-    # if frame_number == 20:
-    #     file = open("test.txt", "w")
-    #     file.write(str(frame))
-    return np.ravel(frame)
 
-def init_dw():
-    dw1 = np.zeros((hidden_layer, input_length))
-    dw2 = np.zeros(hidden_layer)
-    db = np.zeros(hidden_layer)
-    return dw1, dw2, db
+    return np.ravel(frame).astype(np.float32)
 
-env = gym.make("ALE/Pong-v5", render_mode="human", obs_type="grayscale")
+def discount_gradients(gradients):
+    x = 1.0
+    for i in range(len(gradients)-2, -1, -1):
+        x *= discount_factor
+        gradients[i][0] *= x
 
-observation, info = env.reset()
+def run():
+    env = gym.make("ALE/Pong-v5", obs_type="grayscale")
+    observation, _ = env.reset()
 
-done = False
-episode_number = 0
+    policy = MLP(6400, 200)
+    # with open('model.pickle', 'rb') as file:
+    #     policy = pickle.load(file)
 
-# policy = Policy()
-with open('newlr0.00002.pickle', 'rb') as file:
-    policy = pickle.load(file)
+    episode_number = 0
+    game_number = 0
+    frame_number = 0
 
-frame_number = 1
-observation = 0
-dw1, dw2, db = init_dw()
+    score = 0
+    total = 0.0
+    while episode_number < episodes:
+        observation = preprocess(np.array(observation))
+        if frame_number < 2:
+            action = env.action_space.sample()
+        else:
+            x = observation-prev_observation
+            if frame_number == 2 and episode_number % 10 == 0 and game_number == 0:
+                policy.reset_grad()
+                tempx = x.copy()
+                tempx -= policy.running_mean
+                tempx /= policy.running_std
+                action, y = policy.choose_action(x)
+                input = [x]
+                output = [[y]]
+                actions = [[1.0 if action==2 else -1.0]] # 1 gradient for up, -1 gradient for down
+            else:
+                action, y = policy.choose_action(x)
+                input.append(x)
+                output.append([y])
+                if frame_number == 2:
+                    actions = [[1.0 if action==2 else -1.0]]
+                else:
+                    actions.append([1.0 if action==2 else -1.0])
 
-while episode_number < episodes:
-    observation = preprocess(observation) if frame_number > 1 else 0
-    # random action for first 2 frames
-    if frame_number <= 2:
-        action = env.action_space.sample()
-    else:
-        # forward pass
-        action, h, y = policy.choose_action(observation-prev_observation)
 
-    prev_observation = observation
-    
-    observation, reward, terminated, truncated, info = env.step(action)
-
-    if frame_number > 2:
-        dy = 1 if action == 3 else -1 # encourages this action
-        # backprop
-        policy.backprop(dy, h, dw1, dw2, db, prev_observation)
-
+        prev_observation = observation
+        observation, reward, terminated, truncated, _ = env.step(action)
+        frame_number += 1
+        
         if reward != 0:
-            # point made
-            print("Point")
-            if reward == 1: # win
-                if action == 2: # up
-                    advantage = y
-                else: # down
-                    advantage = 1-y
-            else: # loss
-                if action == 2: # up
-                    advantage = 1-y
-                else: # down
-                    advantage = y
-            policy.update_weights(reward * advantage * dw1 * learning_rate, reward * advantage * dw2 * learning_rate, reward * advantage * db * learning_rate)
-            dw1, dw2, db = init_dw()
+            frame_number = 0
+            actions = np.array(actions)
+            rewards = np.vstack([reward]*actions.shape[0])
+            discount_gradients(rewards)
+            rewards -= rewards.mean()
+            rewards /= rewards.std()
+            actions *= rewards
+            if game_number == 0 and episode_number % 10 == 0:
+                gradients = actions.copy()
+            else:
+                gradients = np.vstack((gradients, actions))
+            game_number += 1
+            
+            if reward == 1:
+                score += 1
 
-    frame_number += 1
-    if terminated or truncated:
-        env.reset()
-        frame_number = 1
-        episode_number += 1
+        if terminated or truncated:
+            episode_number += 1
 
-print(policy.w1)
-print(policy.w2)
-print(policy.b)
+            if episode_number % 10 == 0 and episode_number > 0:
+                input = np.array(input)
+                policy.backprop(input, np.array(output), gradients)
+
+            observation, _ = env.reset()
+            print(f'Episode {episode_number}, Score {score}')
+            
+            total += score
+            score = 0
+            game_number = 0
+    env.close()
+    with open('model.pickle', 'wb') as file:
+        pickle.dump(policy, file)
+    print(total / episodes)
+
+if __name__ == "__main__":
+    run()
